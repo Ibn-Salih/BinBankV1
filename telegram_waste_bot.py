@@ -16,7 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # States for conversation handler
-CHOOSING_ROLE, ENTER_NAME, ENTER_PHONE, ENTER_LOCATION, ENTER_VERIFICATION_CODE, ENTER_WEIGHT, ENTER_RECYCLING_VERIFICATION = range(7)
+CHOOSING_ROLE, ENTER_NAME, ENTER_PHONE, ENTER_LOCATION, ENTER_VERIFICATION_CODE, ENTER_WEIGHT, ENTER_RECYCLING_VERIFICATION, ENTER_RECYCLER_NAME = range(8)
 
 # Database setup
 def setup_database():
@@ -94,7 +94,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Available commands:\n"
             "/status - Toggle your online status\n"
             "/request - Create a pickup request (for Waste Creators)\n"
-            "/complete - Complete a pickup (for Waste Collectors)"
+            "/complete - Complete a pickup (for Waste Collectors)\n"
+            "/recycle - Initiate recycling (for Waste Collectors)"
         )
         return ConversationHandler.END
     
@@ -162,12 +163,21 @@ async def location_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
             
+            # Create role-specific command list
+            commands = ["/status - Toggle your online status"]
+            
+            if context.user_data['role'] == 'Waste Creator':
+                commands.append("/request - Create a pickup request")
+            elif context.user_data['role'] == 'Waste Collector':
+                commands.append("/complete - Complete a pickup")
+                commands.append("/recycle - Initiate recycling")
+            elif context.user_data['role'] == 'Recycling Company':
+                commands.append("/weight - Record waste weight")
+                commands.append("/verify_recycling - Verify recycling transaction")
+            
             await update.message.reply_text(
-                f"Registration complete! You are now registered as a {context.user_data['role']}.\n"
-                "Available commands:\n"
-                "/status - Toggle your online status\n"
-                "/request - Create a pickup request (for Waste Creators)\n"
-                "/complete - Complete a pickup (for Waste Collectors)"
+                f"Registration complete! You are now registered as a {context.user_data['role']}.\n\n"
+                "Available commands:\n" + "\n".join(commands)
             )
             return ConversationHandler.END
         else:
@@ -430,20 +440,29 @@ async def process_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ENTER_WEIGHT
         
         user_id = update.message.from_user.id
+        
         conn = sqlite3.connect('waste_management.db')
         cursor = conn.cursor()
         
-        # Get active collectors
+        # Find the collector who initiated the recycling
         cursor.execute('''
-            SELECT telegram_id
-            FROM users
-            WHERE role = 'Waste Collector'
-            AND is_online = 1
-        ''')
-        collectors = cursor.fetchall()
+            SELECT u.telegram_id, u.full_name
+            FROM users u
+            WHERE u.role = 'Waste Collector'
+            AND u.telegram_id IN (
+                SELECT collector_id 
+                FROM recycling_transactions 
+                WHERE recycler_id = ? 
+                AND status = 'pending'
+                ORDER BY created_at DESC 
+                LIMIT 1
+            )
+        ''', (user_id,))
         
-        if not collectors:
-            await update.message.reply_text("No active waste collectors found.")
+        collector = cursor.fetchone()
+        
+        if not collector:
+            await update.message.reply_text("No pending recycling transaction found. Please wait for a waste collector to initiate recycling.")
             conn.close()
             return ConversationHandler.END
         
@@ -458,25 +477,29 @@ async def process_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             INSERT INTO recycling_transactions 
             (collector_id, recycler_id, weight_kg, amount_paid, verification_code)
             VALUES (?, ?, ?, ?, ?)
-        ''', (collectors[0][0], user_id, weight, amount, verification_code))
+        ''', (collector[0], user_id, weight, amount, verification_code))
         
         transaction_id = cursor.lastrowid
         
-        # Notify collector
+        # Store transaction info and verification code in context
+        context.user_data['current_transaction'] = (transaction_id, collector[0], verification_code)
+        logger.info(f"Stored in context - Transaction info: {context.user_data['current_transaction']}")
+        
+        # Notify collector with verification code
         try:
+            logger.info(f"Attempting to notify collector with ID: {collector[0]}")
             await context.bot.send_message(
-                chat_id=collectors[0][0],
-                text=f"New recycling transaction (ID: {transaction_id})\n"
-                     f"Weight: {weight}kg\n"
-                     f"Amount to be paid: ${amount:.2f}\n"
-                     f"Verification code: {verification_code}"
+                chat_id=collector[0],
+                text=f"Your recycling company has recorded the weight!\n"
+                     f"Please provide them with this verification code: {verification_code}"
             )
+            logger.info("Successfully notified collector")
         except Exception as e:
             logger.error(f"Could not notify collector: {e}")
         
         await update.message.reply_text(
             f"Transaction recorded!\n"
-            f"Please collect the verification code from the collector and use /verify_recycling to complete the transaction."
+            f"Please ask the waste collector for the verification code and use /verify_recycling to complete the transaction."
         )
         
         conn.commit()
@@ -506,74 +529,165 @@ async def verify_recycling(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SELECT id, collector_id, verification_code
         FROM recycling_transactions
         WHERE recycler_id = ? AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
     ''', (user_id,))
-    transactions = cursor.fetchall()
+    transaction = cursor.fetchone()
     
-    if not transactions:
+    if not transaction:
         await update.message.reply_text("You have no pending recycling transactions.")
         conn.close()
         return
     
     # Store transaction info in context
-    context.user_data['current_transaction'] = transactions[0]
+    context.user_data['current_transaction'] = transaction
+    logger.info(f"Stored transaction info in context: {transaction}")
     
     await update.message.reply_text(
         "Please enter the 4-digit verification code provided by the waste collector:"
     )
     return ENTER_RECYCLING_VERIFICATION
 
-async def verify_recycling_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    provided_code = update.message.text.strip()
-    transaction_info = context.user_data.get('current_transaction')
-    
-    logger.info("=== Recycling Verification Process Started ===")
-    logger.info(f"User ID: {update.message.from_user.id}")
-    logger.info(f"Provided code: '{provided_code}' (length: {len(provided_code)})")
-    logger.info(f"Transaction info: {transaction_info}")
-    logger.info(f"Full context user data: {context.user_data}")
-    
-    if not transaction_info:
-        logger.error("=== Verification Failed ===")
-        logger.error("Missing transaction info in context")
-        await update.message.reply_text("No active transaction found. Please use /verify_recycling again.")
-        return ConversationHandler.END
+async def recycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    logger.info("=== Recycling Process Started ===")
+    logger.info(f"Collector ID: {user_id}")
     
     conn = sqlite3.connect('waste_management.db')
     cursor = conn.cursor()
     
-    stored_code = transaction_info[2]  # verification_code
-    logger.info(f"Stored code from database: '{stored_code}' (length: {len(stored_code) if stored_code else 0})")
+    # Check if user is a waste collector
+    cursor.execute('SELECT role FROM users WHERE telegram_id = ?', (user_id,))
+    user_role = cursor.fetchone()
+    
+    if not user_role or user_role[0] != 'Waste Collector':
+        logger.error(f"User {user_id} is not a waste collector")
+        await update.message.reply_text("Only Waste Collectors can initiate recycling.")
+        conn.close()
+        return
+    
+    # Store collector info in context
+    context.user_data['collector_id'] = user_id
+    
+    await update.message.reply_text("Please enter the recycling company's full name:")
+    return ENTER_RECYCLER_NAME
+
+async def process_recycler_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    recycler_name = update.message.text.strip()
+    collector_id = context.user_data.get('collector_id')
+    
+    conn = sqlite3.connect('waste_management.db')
+    cursor = conn.cursor()
+    
+    # Find recycler by name
+    cursor.execute('''
+        SELECT telegram_id, full_name
+        FROM users
+        WHERE role = 'Recycling Company'
+        AND full_name LIKE ?
+    ''', (f'%{recycler_name}%',))
+    
+    recycler = cursor.fetchone()
+    
+    if not recycler:
+        await update.message.reply_text("No recycling company found with that name. Please try again:")
+        return ENTER_RECYCLER_NAME
+    
+    # Generate verification code
+    verification_code = generate_verification_code()
+    logger.info(f"Generated verification code: {verification_code}")
+    
+    # Store recycler info and verification code in context
+    context.user_data['current_recycling'] = (recycler[0], verification_code)
+    logger.info(f"Stored in context - Recycler info: {recycler[0]}, Verification code: {verification_code}")
+    
+    # Notify recycler with verification code
+    try:
+        logger.info(f"Attempting to notify recycler with ID: {recycler[0]}")
+        await context.bot.send_message(
+            chat_id=recycler[0],
+            text=f"A waste collector has arrived with waste for recycling!\n"
+                 f"Please provide them with this verification code: {verification_code}"
+        )
+        logger.info("Successfully notified recycler")
+    except Exception as e:
+        logger.error(f"Could not notify recycler: {e}")
+        await update.message.reply_text("Error: Could not notify recycling company. Please try again.")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "Please ask the recycling company for the verification code and enter it here:"
+    )
+    logger.info("=== Recycling Process Completed - Waiting for Verification ===")
+    return ENTER_RECYCLING_VERIFICATION
+
+async def verify_recycling_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    provided_code = update.message.text.strip()
+    recycling_info = context.user_data.get('current_recycling')
+    
+    logger.info("=== Recycling Verification Process Started ===")
+    logger.info(f"User ID: {update.message.from_user.id}")
+    logger.info(f"Provided code: '{provided_code}' (length: {len(provided_code)})")
+    logger.info(f"Recycling info: {recycling_info}")
+    logger.info(f"Full context user data: {context.user_data}")
+    
+    if not recycling_info:
+        logger.error("=== Verification Failed ===")
+        logger.error("Missing recycling info in context")
+        await update.message.reply_text("No active recycling found. Please use /recycle again.")
+        return ConversationHandler.END
+    
+    stored_code = recycling_info[1]  # verification_code
+    logger.info(f"Stored code: '{stored_code}' (length: {len(stored_code) if stored_code else 0})")
     
     if provided_code == stored_code:
         logger.info("=== Verification Successful ===")
-        # Update transaction status
-        cursor.execute('''
-            UPDATE recycling_transactions
-            SET status = 'completed'
-            WHERE id = ?
-        ''', (transaction_info[0],))
-        logger.info(f"Updated recycling transaction {transaction_info[0]} status to 'completed'")
+        conn = sqlite3.connect('waste_management.db')
+        cursor = conn.cursor()
         
-        # Notify collector
+        # Create recycling transaction
+        cursor.execute('''
+            INSERT INTO recycling_transactions 
+            (collector_id, recycler_id, status)
+            VALUES (?, ?, 'completed')
+        ''', (update.message.from_user.id, recycling_info[0]))
+        
+        transaction_id = cursor.lastrowid
+        logger.info(f"Created recycling transaction {transaction_id}")
+        
+        # Notify both collector and recycler
+        completion_message = f"✅ Recycling Complete!\nTransaction ID: {transaction_id}\nStatus: Successfully completed"
+        
         try:
-            logger.info(f"Attempting to notify collector with ID: {transaction_info[1]}")
+            # Notify recycler
+            logger.info(f"Attempting to notify recycler with ID: {recycling_info[0]}")
             await context.bot.send_message(
-                chat_id=transaction_info[1],
-                text=f"Your recycling transaction (ID: {transaction_info[0]}) has been completed!"
+                chat_id=recycling_info[0],
+                text=completion_message
+            )
+            logger.info("Successfully notified recycler")
+            
+            # Notify collector
+            logger.info(f"Attempting to notify collector with ID: {update.message.from_user.id}")
+            await context.bot.send_message(
+                chat_id=update.message.from_user.id,
+                text=completion_message
             )
             logger.info("Successfully notified collector")
+            
+            await update.message.reply_text("Recycling transaction marked as completed!")
         except Exception as e:
-            logger.error(f"Could not notify collector: {e}")
+            logger.error(f"Error sending notifications: {str(e)}")
+            await update.message.reply_text("Recycling completed but there was an error sending notifications.")
         
-        await update.message.reply_text(f"Recycling transaction (ID: {transaction_info[0]}) marked as completed!")
+        conn.commit()
+        conn.close()
         logger.info("=== Recycling Verification Process Completed Successfully ===")
     else:
         logger.error("=== Verification Failed ===")
         logger.error(f"Code mismatch - Provided: '{provided_code}', Expected: '{stored_code}'")
         await update.message.reply_text("Invalid verification code. Please try again.")
     
-    conn.commit()
-    conn.close()
     return ConversationHandler.END
 
 def main():
@@ -596,7 +710,8 @@ def main():
         conv_handler = ConversationHandler(
             entry_points=[
                 CommandHandler('start', start),
-                CommandHandler('complete', complete_pickup)
+                CommandHandler('complete', complete_pickup),
+                CommandHandler('recycle', recycle)
             ],
             states={
                 CHOOSING_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, role_chosen)],
@@ -606,6 +721,7 @@ def main():
                 ENTER_VERIFICATION_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_pickup_code)],
                 ENTER_RECYCLING_VERIFICATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_recycling_code)],
                 ENTER_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_weight)],
+                ENTER_RECYCLER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_recycler_name)],
             },
             fallbacks=[],
         )
@@ -615,8 +731,8 @@ def main():
         # Add other command handlers
         application.add_handler(CommandHandler("status", toggle_status))
         application.add_handler(CommandHandler("request", create_request))
-        application.add_handler(CommandHandler("weight", record_weight))
         application.add_handler(CommandHandler("verify_recycling", verify_recycling))
+        application.add_handler(CommandHandler("weight", record_weight))
         
         # Start the bot
         print("Starting bot...")
