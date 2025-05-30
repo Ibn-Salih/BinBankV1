@@ -1,22 +1,60 @@
-import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import sys
+import logging as py_logging
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 import sqlite3
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 import os
 import random
 import string
+from pycardano import *
+import json
+from dotenv import load_dotenv
+from yoroi_integration import YoroiWallet
 
-# Enable logging
-logging.basicConfig(
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+py_logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=py_logging.INFO
 )
-logger = logging.getLogger(__name__)
+logger = py_logging.getLogger(__name__)
+
+# Cardano configuration from environment variables
+NETWORK = Network.TESTNET if os.getenv('CARDANO_NETWORK') == 'testnet' else Network.MAINNET
+context = BlockFrostChainContext(
+    project_id=os.getenv('BLOCKFROST_PROJECT_ID'),
+    network=NETWORK
+)
+
+# Cardano configuration dictionary
+cardano_config = {
+    'network': os.getenv('CARDANO_NETWORK'),
+    'sender_address': os.getenv('CARDANO_SENDER_ADDRESS'),
+    'sender_private_key': os.getenv('CARDANO_SENDER_PRIVATE_KEY'),
+    'reward_amount': int(os.getenv('CARDANO_REWARD_AMOUNT', '2000000'))
+}
+
+# Validate required environment variables
+required_vars = [
+    'BLOCKFROST_PROJECT_ID',
+    'CARDANO_NETWORK',
+    'CARDANO_SENDER_ADDRESS',
+    'CARDANO_SENDER_PRIVATE_KEY'
+]
+
+missing_vars = [var for var in required_vars if not os.getenv(var)]
+if missing_vars:
+    raise Exception(f"Missing required environment variables: {', '.join(missing_vars)}")
 
 # States for conversation handler
-CHOOSING_ROLE, ENTER_NAME, ENTER_PHONE, ENTER_LOCATION, ENTER_VERIFICATION_CODE, ENTER_WEIGHT, ENTER_RECYCLING_VERIFICATION, ENTER_RECYCLER_NAME = range(8)
+CHOOSING_ROLE, ENTER_NAME, ENTER_PHONE, ENTER_LOCATION, ENTER_VERIFICATION_CODE, ENTER_WEIGHT, ENTER_RECYCLING_VERIFICATION, ENTER_RECYCLER_NAME, ENTER_WASTE_DESCRIPTION, ENTER_WALLET = range(10)
+
+# Initialize Yoroi wallet
+yoroi_wallet = YoroiWallet()
 
 # Database setup
 def setup_database():
@@ -37,7 +75,8 @@ def setup_database():
             latitude REAL,
             longitude REAL,
             role TEXT NOT NULL,
-            is_online INTEGER DEFAULT 1
+            is_online INTEGER DEFAULT 1,
+            wallet_address TEXT
         )
     ''')
     
@@ -47,7 +86,10 @@ def setup_database():
             id INTEGER PRIMARY KEY,
             creator_id INTEGER,
             collector_id INTEGER,
+            waste_type TEXT DEFAULT 'Plastic',
+            waste_description TEXT,
             status TEXT DEFAULT 'pending',
+            payment_status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (creator_id) REFERENCES users (telegram_id),
             FOREIGN KEY (collector_id) REFERENCES users (telegram_id)
@@ -224,8 +266,27 @@ async def create_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
     
-    # Create pickup request
-    cursor.execute('INSERT INTO pickup_requests (creator_id) VALUES (?)', (user_id,))
+    await update.message.reply_text(
+        "Please provide a brief description of the plastic waste (optional):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    return ENTER_WASTE_DESCRIPTION
+
+async def process_waste_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    waste_description = update.message.text
+    user_id = update.message.from_user.id
+    
+    conn = sqlite3.connect('waste_management.db')
+    cursor = conn.cursor()
+    
+    # Create pickup request with waste type and description
+    cursor.execute('''
+        INSERT INTO pickup_requests 
+        (creator_id, waste_type, waste_description) 
+        VALUES (?, ?, ?)
+    ''', (user_id, 'Plastic', waste_description))
+    
     request_id = cursor.lastrowid
     
     # Find available collector
@@ -261,6 +322,8 @@ async def create_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Notify creator
         await update.message.reply_text(
             f"Pickup request created (ID: {request_id})!\n"
+            f"Waste Type: Plastic\n"
+            f"Description: {waste_description}\n"
             f"A collector has been assigned and will pick up your waste within 5 hours.\n"
             f"You will receive a verification code when the collector arrives."
         )
@@ -270,6 +333,8 @@ async def create_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=nearest_collector[0],
                 text=f"New pickup request (ID: {request_id}) has been assigned to you.\n"
+                     f"Waste Type: Plastic\n"
+                     f"Description: {waste_description}\n"
                      "Please complete the pickup within 5 hours."
             )
         except Exception as e:
@@ -287,6 +352,7 @@ async def create_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     conn.commit()
     conn.close()
+    return ConversationHandler.END
 
 async def complete_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -372,41 +438,56 @@ async def verify_pickup_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn = sqlite3.connect('waste_management.db')
         cursor = conn.cursor()
         
-        # Update pickup status
-        cursor.execute('''
-            UPDATE pickup_requests
-            SET status = 'completed'
-            WHERE id = ?
-        ''', (pickup_info[0],))
-        logger.info(f"Updated pickup request {pickup_info[0]} status to 'completed'")
-        
-        # Notify both creator and collector
-        completion_message = f"✅ Pickup Complete!\nRequest ID: {pickup_info[0]}\nStatus: Successfully completed"
-        
         try:
+            # Update pickup status
+            cursor.execute('''
+                UPDATE pickup_requests
+                SET status = 'completed'
+                WHERE id = ?
+            ''', (pickup_info[0],))
+            logger.info(f"Updated pickup request {pickup_info[0]} status to 'completed'")
+            
+            # Get creator and collector IDs
+            cursor.execute('''
+                SELECT creator_id, collector_id
+                FROM pickup_requests
+                WHERE id = ?
+            ''', (pickup_info[0],))
+            users = cursor.fetchone()
+            
+            if not users:
+                raise Exception("Could not find users for this pickup request")
+            
+            creator_id, collector_id = users
+            
+            # Send completion message to both users
+            completion_message = f"✅ Pickup Complete!\nRequest ID: {pickup_info[0]}\nStatus: Successfully completed"
+            
             # Notify creator
-            logger.info(f"Attempting to notify creator with ID: {pickup_info[1]}")
             await context.bot.send_message(
-                chat_id=pickup_info[1],  # creator_id
+                chat_id=creator_id,
                 text=completion_message
             )
-            logger.info("Successfully notified creator")
             
             # Notify collector
-            logger.info(f"Attempting to notify collector with ID: {update.message.from_user.id}")
             await context.bot.send_message(
-                chat_id=update.message.from_user.id,
+                chat_id=collector_id,
                 text=completion_message
             )
-            logger.info("Successfully notified collector")
+            
+            # Ask for wallet addresses for both creator and collector
+            await ask_for_wallet(update, context, creator_id, 'creator')
+            await ask_for_wallet(update, context, collector_id, 'collector')
             
             await update.message.reply_text("Pickup request marked as completed!")
+            
         except Exception as e:
-            logger.error(f"Error sending notifications: {str(e)}")
-            await update.message.reply_text("Pickup completed but there was an error sending notifications.")
-        
-        conn.commit()
-        conn.close()
+            logger.error(f"Error in verification process: {e}")
+            await update.message.reply_text("Error processing completion. Please try again.")
+        finally:
+            conn.commit()
+            conn.close()
+            
         logger.info("=== Pickup Verification Process Completed Successfully ===")
     else:
         logger.error("=== Verification Failed ===")
@@ -783,6 +864,129 @@ async def verify_recycling_code(update: Update, context: ContextTypes.DEFAULT_TY
     
     return ConversationHandler.END
 
+async def wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Parse the callback data
+        parts = query.data.split('_')
+        if len(parts) != 3:
+            logger.error(f"Invalid callback data format: {query.data}")
+            await query.message.reply_text("Error processing wallet request. Please try again.")
+            return ConversationHandler.END
+            
+        _, user_id, role = parts
+        user_id = int(user_id)
+        
+        # Store the user info in context
+        context.user_data['wallet_user_id'] = user_id
+        context.user_data['wallet_role'] = role
+        
+        # Send a new message asking for the wallet address
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Please enter your Cardano wallet address to receive your 2 ADA reward:"
+        )
+        
+        # Set the conversation state to ENTER_WALLET
+        return ENTER_WALLET
+        
+    except Exception as e:
+        logger.error(f"Error in wallet callback: {e}")
+        await query.message.reply_text("Error processing wallet request. Please try again.")
+        return ConversationHandler.END
+
+async def ask_for_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, role: str):
+    try:
+        keyboard = [
+            [
+                InlineKeyboardButton("Create Cardano Wallet", url="https://daedaluswallet.io/"),
+                InlineKeyboardButton("I have a wallet", callback_data=f"has_wallet_{user_id}_{role}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = await context.bot.send_message(
+            chat_id=user_id,
+            text=f"To receive your 2 ADA reward for contributing to plastic waste management, "
+                 f"please provide your Cardano wallet address.\n\n"
+                 f"If you don't have a wallet yet, you can create one using Daedalus wallet.",
+            reply_markup=reply_markup
+        )
+        logger.info(f"Sent wallet prompt to user {user_id} with role {role}")
+        return ENTER_WALLET
+    except Exception as e:
+        logger.error(f"Error asking for wallet: {e}")
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Error processing wallet request. Please try again."
+        )
+        return ConversationHandler.END
+
+async def process_wallet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wallet_address = update.message.text.strip()
+    
+    # Get the user ID from context or use the message sender's ID
+    user_id = context.user_data.get('wallet_user_id', update.message.from_user.id)
+    
+    # Validate Cardano address format
+    try:
+        PaymentAddress.from_primitive(wallet_address)
+    except Exception as e:
+        await update.message.reply_text(
+            "Invalid Cardano wallet address. Please provide a valid address:"
+        )
+        return ENTER_WALLET
+    
+    conn = sqlite3.connect('waste_management.db')
+    cursor = conn.cursor()
+    
+    try:
+        # Update user's wallet address
+        cursor.execute('''
+            UPDATE users
+            SET wallet_address = ?
+            WHERE telegram_id = ?
+        ''', (wallet_address, user_id))
+        
+        conn.commit()
+        
+        # Send 2 ADA reward
+        success = await send_cardano_payment(wallet_address, cardano_config['reward_amount'])
+        
+        if success:
+            await update.message.reply_text(
+                "🎉 Congratulations! 🎉\n\n"
+                "You've successfully contributed to saving our community from improperly disposed plastic waste!\n\n"
+                "Your 2 ADA reward has been sent to your wallet.\n"
+                "Thank you for being part of the solution to make our environment cleaner and safer.\n\n"
+                "Together, we can make a difference! 🌱♻️"
+            )
+        else:
+            await update.message.reply_text(
+                "There was an error processing your reward. Please try again later."
+            )
+    except Exception as e:
+        logger.error(f"Error processing wallet address: {e}")
+        await update.message.reply_text(
+            "There was an error processing your wallet address. Please try again."
+        )
+    finally:
+        conn.close()
+    
+    return ConversationHandler.END
+
+async def send_cardano_payment(recipient_address: str, amount: int) -> bool:
+    """
+    Send ADA using Yoroi wallet integration
+    """
+    try:
+        return await yoroi_wallet.send_payment(recipient_address, amount)
+    except Exception as e:
+        logger.error(f"Error sending Cardano payment: {e}")
+        return False
+
 def main():
     # Setup database
     setup_database()
@@ -806,7 +1010,8 @@ def main():
                 CommandHandler('complete', complete_pickup),
                 CommandHandler('recycle', recycle),
                 CommandHandler('weight', record_weight),
-                CommandHandler('verify_recycling', verify_recycling)
+                CommandHandler('verify_recycling', verify_recycling),
+                CommandHandler('request', create_request)
             ],
             states={
                 CHOOSING_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, role_chosen)],
@@ -817,15 +1022,21 @@ def main():
                 ENTER_RECYCLING_VERIFICATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_recycling_code)],
                 ENTER_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_weight)],
                 ENTER_RECYCLER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_recycler_name)],
+                ENTER_WASTE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_waste_description)],
+                ENTER_WALLET: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, process_wallet_address),
+                    CallbackQueryHandler(wallet_callback, pattern="^has_wallet_")
+                ],
             },
-            fallbacks=[],
+            fallbacks=[CommandHandler('cancel', lambda u, c: ConversationHandler.END)],
+            name="waste_management_conversation",
+            persistent=False
         )
         
         application.add_handler(conv_handler)
         
         # Add other command handlers
         application.add_handler(CommandHandler("status", toggle_status))
-        application.add_handler(CommandHandler("request", create_request))
         
         # Start the bot
         print("Starting bot...")
